@@ -1,4 +1,4 @@
-﻿using SneakerShop;
+using SneakerShop;
 using SneakerShop.Models;
 using System;
 using System.Collections.Generic;
@@ -17,12 +17,13 @@ namespace SneakerShop.Forms
         private MainMenu mainMenu;
         private Label[] statValueLabels = new Label[4]; // Store references to value labels
         private List<decimal> realSalesData = new List<decimal>(); // Store real sales data for chart
-
+        private ISalesDataStrategy salesStrategy;
         public DashboardForm(MainMenu mainMenu = null)
         {
             this.mainMenu = mainMenu;
-
+            salesStrategy = new MockSalesDataStrategy();
             // Remove InitializeComponent() - we're building everything manually
+            SupabaseClient.Initialize();
             this.BackColor = Color.FromArgb(248, 250, 252);
             this.ClientSize = new Size(1200, 800);
             this.Name = "DashboardForm";
@@ -66,17 +67,19 @@ namespace SneakerShop.Forms
 
                 // Convert to list in correct order (oldest to newest)
                 realSalesData = dailySales.OrderBy(kv => kv.Key)
-                                          .Select(kv => kv.Value)
-                                          .ToList();
+                          .Select(kv => kv.Value)
+                          .ToList();
 
-                // Force chart to redraw with real data
+                // Use REAL strategy
+                salesStrategy = new RealSalesDataStrategy(realSalesData);
+
                 mainScrollPanel.Invalidate();
             }
             catch (Exception ex)
             {
                 MessageBox.Show($"Failed to load chart data: {ex.Message}", "Error");
                 // Fall back to mock data if real data fails
-                realSalesData = new List<decimal> { 2230, 2885, 1758, 2414, 2447, 2730, 2100 };
+                salesStrategy = new MockSalesDataStrategy();
             }
         }
 
@@ -95,7 +98,12 @@ namespace SneakerShop.Forms
                     .Where(s => s.Date >= sevenDaysAgo)
                     .Order(s => s.Date, Postgrest.Constants.Ordering.Descending)
                     .Get();
-
+                string debug = $"Found {sales.Models.Count} sales in last 7 days:\n";
+                foreach (var sale in sales.Models)
+                {
+                    debug += $"{sale.Date.ToShortDateString()}: ${sale.TotalAmount}\n";
+                }
+                MessageBox.Show(debug, "Database Sales");
                 return sales.Models;
             }
             catch (Exception ex)
@@ -125,6 +133,12 @@ namespace SneakerShop.Forms
                     dailyTotals[saleDate] += sale.TotalAmount;
                 }
             }
+            string debug = "Grouped daily totals:\n";
+            foreach (var kv in dailyTotals.OrderBy(k => k.Key))
+            {
+                debug += $"{kv.Key.ToShortDateString()}: ${kv.Value}\n";
+            }
+            MessageBox.Show(debug, "Grouped Data");
 
             return dailyTotals;
         }
@@ -149,6 +163,164 @@ namespace SneakerShop.Forms
 
             if (statValueLabels[3] != null)
                 statValueLabels[3].Text = $"{stats.BrandCount} brands";
+        }
+        private async Task GenerateMockSalesForTesting()
+        {
+            try
+            {
+                SupabaseClient.Initialize();
+                var client = SupabaseClient.Client;
+
+                Random rand = new Random();
+
+                // Get customers from database
+                var response = await client.From<Customer>().Get();
+                var customers = response.Models;
+
+                if (customers == null || customers.Count == 0)
+                {
+                    MessageBox.Show("No customers found. Please add a customer first.", "Error");
+                    return;
+                }
+
+                // Get the first customer ID
+                var firstCustomer = customers[0];
+                dynamic dynamicCustomer = firstCustomer;
+                string customerId = null;
+
+                try { customerId = dynamicCustomer.Id; } catch { }
+                if (customerId == null) try { customerId = dynamicCustomer.id; } catch { }
+                if (customerId == null) try { customerId = dynamicCustomer.CustomerId; } catch { }
+                if (customerId == null) try { customerId = dynamicCustomer.customer_id; } catch { }
+
+                if (string.IsNullOrEmpty(customerId))
+                {
+                    MessageBox.Show("Could not find customer ID property", "Error");
+                    return;
+                }
+
+                MessageBox.Show($"Using customer ID: {customerId}", "Success");
+
+                int totalAdded = 0;
+
+                // Generate sales for the last 7 days
+                for (int i = 0; i < 7; i++)
+                {
+                    DateTime saleDate = DateTime.Now.AddDays(-i);
+
+                    int salesPerDay = rand.Next(2, 5);
+                    for (int j = 0; j < salesPerDay; j++)
+                    {
+                        var sale = new Sale
+                        {
+                            Id = Guid.NewGuid().ToString(),
+                            CustomerId = customerId,
+                            Date = saleDate,
+                            TotalAmount = rand.Next(500, 3000)
+                        };
+
+                        await client.From<Sale>().Insert(sale);
+                        totalAdded++;
+                    }
+
+                }
+
+                MessageBox.Show($"✅ Success! Added {totalAdded} test sales!", "Success");
+
+                // ===== FIX: Force complete reload of chart data =====
+                await ForceReloadChartData();
+
+                // FORCE the chart picture box to redraw
+                foreach (Control c in mainScrollPanel.Controls)
+                {
+                    if (c is Panel panel)
+                    {
+                        foreach (Control inner in panel.Controls)
+                        {
+                            // Find the chart container panel
+                            if (inner is Panel chartContainer && chartContainer.Controls.Count > 0)
+                            {
+                                foreach (Control chartControl in chartContainer.Controls)
+                                {
+                                    // Find the PictureBox that holds the chart
+                                    if (chartControl is PictureBox chartPicture)
+                                    {
+                                        chartPicture.Invalidate();  // Force redraw
+                                        chartPicture.Update();
+                                        chartPicture.Refresh();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                mainScrollPanel.Invalidate();
+                mainScrollPanel.Update();
+                mainScrollPanel.Refresh();
+
+                DebugSalesData();
+
+                // Also refresh stats
+                var freshStats = await SupabaseClient.GetDashboardStatsAsync();
+                UpdateStatsCardsWithRealData(freshStats);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error generating mock sales: {ex.Message}", "Error");
+            }
+        }
+
+        // Add this NEW method to your DashboardForm
+        private async Task ForceReloadChartData()
+        {
+            try
+            {
+                // Clear existing data
+                realSalesData.Clear();
+
+                // Fetch fresh sales data
+                var sales = await GetLast7DaysSalesAsync();
+                var dailySales = GroupSalesByDay(sales);
+
+                realSalesData = dailySales.OrderBy(kv => kv.Key)
+                                          .Select(kv => kv.Value)
+                                          .ToList();
+
+                // Update strategy with new data
+                salesStrategy = new RealSalesDataStrategy(realSalesData);
+
+                // Force chart to redraw
+                mainScrollPanel.Invalidate();
+
+                // Also refresh stats
+                var stats = await SupabaseClient.GetDashboardStatsAsync();
+                UpdateStatsCardsWithRealData(stats);
+
+                MessageBox.Show($"Chart updated with {realSalesData.Count} days of real data!", "Refresh Complete");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error refreshing chart: {ex.Message}", "Error");
+            }
+        }
+        // Add this method anywhere in your DashboardForm class
+        private void DebugSalesData()
+        {
+            string debugMessage = "Current salesStrategy type: " + salesStrategy.GetType().Name + "\n\n";
+
+            decimal[] data = salesStrategy.GetSalesData();
+            string[] days = salesStrategy.GetDayLabels();
+
+            debugMessage += "Sales Data for last 7 days:\n";
+            for (int i = 0; i < data.Length; i++)
+            {
+                debugMessage += $"{days[i]}: ${data[i]}\n";
+            }
+
+            debugMessage += $"\nMax value: ${data.Max()}";
+
+            MessageBox.Show(debugMessage, "Chart Data Debug");
         }
 
         private void SetupDashboardUI()
@@ -265,7 +437,7 @@ namespace SneakerShop.Forms
 
             // Draw chart
             PictureBox chartPicture = new PictureBox();
-            chartPicture.Size = new Size(740, 250);
+            chartPicture.Size = new Size(740, 450);
             chartPicture.Location = new Point(20, 60);
             chartPicture.Paint += DrawSalesChart;
             chartContainer.Controls.Add(chartPicture);
@@ -428,7 +600,30 @@ namespace SneakerShop.Forms
 
                 actionsPanel.Controls.Add(actionBtn);
             }
+            // ===== TEMPORARY TEST BUTTON - REMOVE AFTER PRESENTATION =====
+            Button btnGenerateMock = new Button();
+            btnGenerateMock.Text = "🧪 Generate Test Sales (Temp)";
+            btnGenerateMock.Font = new Font("Segoe UI", 11F, FontStyle.Bold);
+            btnGenerateMock.FlatStyle = FlatStyle.Flat;
+            btnGenerateMock.FlatAppearance.BorderSize = 0;
+            btnGenerateMock.BackColor = Color.FromArgb(255, 193, 7); // Yellow
+            btnGenerateMock.ForeColor = Color.Black;
+            btnGenerateMock.Size = new Size(340, 38);
+            btnGenerateMock.Location = new Point(20, 60 + (actions.Length * 42) + 10); // Below other buttons
+            btnGenerateMock.TextAlign = ContentAlignment.MiddleLeft;
+            btnGenerateMock.Cursor = Cursors.Hand;
 
+            // Hover effect
+            btnGenerateMock.MouseEnter += (s, e) => btnGenerateMock.BackColor = Color.FromArgb(255, 213, 79);
+            btnGenerateMock.MouseLeave += (s, e) => btnGenerateMock.BackColor = Color.FromArgb(255, 193, 7);
+
+            // Click event
+            btnGenerateMock.Click += async (s, e) => await GenerateMockSalesForTesting();
+
+            actionsPanel.Controls.Add(btnGenerateMock);
+
+            // Make panel taller to fit the new button
+            actionsPanel.Size = new Size(380, 250); // Increased from 200 to 250
             // ========== ACTIVITY FEED ==========
             Panel activityPanel = new Panel();
             activityPanel.Size = new Size(380, 260);
@@ -563,26 +758,43 @@ namespace SneakerShop.Forms
 
         private void DrawSalesChart(object sender, PaintEventArgs e)
         {
+            Console.WriteLine("Drawing chart with strategy: " + salesStrategy.GetType().Name);
             PictureBox pictureBox = (PictureBox)sender;
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
 
             // Chart area
-            int chartX = 40;
-            int chartY = 20;
-            int chartWidth = 660;
-            int chartHeight = 200;
+            int chartX = 50;
+            int chartY = 30;
+            int chartWidth = 640;
+            int chartHeight = 180;
 
-            // Background
-            g.FillRectangle(Brushes.White, chartX, chartY, chartWidth, chartHeight);
-            g.DrawRectangle(new Pen(Color.FromArgb(220, 220, 220)),
-                chartX, chartY, chartWidth, chartHeight);
+            // Clear the chart area
+            g.FillRectangle(Brushes.White, chartX - 10, chartY - 10, chartWidth + 20, chartHeight + 30);
 
-            // Grid lines
-            using (Pen gridPen = new Pen(Color.FromArgb(245, 245, 245)))
+            // Get data from strategy
+            decimal[] salesData = salesStrategy.GetSalesData();
+            string[] days = salesStrategy.GetDayLabels();
+
+            // Draw title
+            using (Font titleFont = new Font("Segoe UI", 12, FontStyle.Bold))
             {
-                // Horizontal grid lines
+                g.DrawString("SALES TREND (LAST 7 DAYS)", titleFont, Brushes.DarkBlue,
+                    chartX, chartY - 25);
+            }
+
+            // Draw background and border
+            g.FillRectangle(Brushes.White, chartX, chartY, chartWidth, chartHeight);
+            g.DrawRectangle(Pens.LightGray, chartX, chartY, chartWidth, chartHeight);
+
+            // Calculate max value
+            decimal maxValue = salesData.Max();
+            if (maxValue == 0) maxValue = 1000; // Default if no data
+
+            // Draw grid lines
+            using (Pen gridPen = new Pen(Color.FromArgb(240, 240, 240)))
+            {
                 for (int i = 0; i <= 5; i++)
                 {
                     int y = chartY + (i * (chartHeight / 5));
@@ -590,93 +802,52 @@ namespace SneakerShop.Forms
                 }
             }
 
-            // Use REAL sales data if available, otherwise use mock data
-            decimal[] salesData;
-            string[] days = new string[7];
+            // Calculate bar width
+            float barWidth = (chartWidth - 40) / salesData.Length - 5;
+            float barSpacing = 20;
 
-            if (realSalesData != null && realSalesData.Count == 7)
-            {
-                // Use real data
-                salesData = realSalesData.ToArray();
-
-                // Generate day labels for the last 7 days
-                for (int i = 0; i < 7; i++)
-                {
-                    var date = DateTime.Now.AddDays(-6 + i);
-                    days[i] = date.ToString("ddd");
-                }
-            }
-            else
-            {
-                // Fallback to mock data
-                salesData = new decimal[] { 2230, 2885, 1758, 2414, 2447, 2730, 2100 };
-                days = new string[] { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
-            }
-
-            decimal maxValue = salesData.Max();
-            if (maxValue == 0) maxValue = 1; // Prevent division by zero
-
-            float pointSpacing = chartWidth / 8f;
-
-            // Calculate points
-            PointF[] points = new PointF[salesData.Length];
+            // Draw bars
             for (int i = 0; i < salesData.Length; i++)
             {
-                float x = chartX + ((i + 1) * pointSpacing);
-                float y = chartY + chartHeight - ((float)(salesData[i] / maxValue) * chartHeight);
-                points[i] = new PointF(x, y);
-            }
+                float barHeight = ((float)salesData[i] / (float)maxValue) * chartHeight;
+                float x = chartX + barSpacing + (i * (barWidth + barSpacing));
+                float y = chartY + chartHeight - barHeight;
 
-            // Draw line
-            using (Pen linePen = new Pen(Color.FromArgb(52, 152, 219), 3))
-            {
-                using (GraphicsPath path = new GraphicsPath())
+                // Draw bar
+                using (SolidBrush barBrush = new SolidBrush(Color.FromArgb(52, 152, 219)))
                 {
-                    path.AddCurve(points, 0.5f);
-                    g.DrawPath(linePen, path);
+                    g.FillRectangle(barBrush, x, y, barWidth, barHeight);
                 }
-            }
 
-            // Draw points and labels
-            for (int i = 0; i < points.Length; i++)
-            {
-                // Draw point
-                g.FillEllipse(Brushes.White, points[i].X - 6, points[i].Y - 6, 12, 12);
-                g.DrawEllipse(new Pen(Color.FromArgb(52, 152, 219), 2),
-                    points[i].X - 6, points[i].Y - 6, 12, 12);
-
-                // Draw value label
-                string valueText = $"${salesData[i]:0}";
-                Font valueFont = new Font("Segoe UI", 9F, FontStyle.Bold);
-                SizeF valueSize = g.MeasureString(valueText, valueFont);
-                float valueX = points[i].X - (valueSize.Width / 2);
-                float valueY = points[i].Y - valueSize.Height - 10;
-
-                if (valueY > chartY + 5)
+                // Draw value on top of bar
+                string valueText = $"${salesData[i]:0,0}";
+                using (Font valueFont = new Font("Segoe UI", 8, FontStyle.Bold))
                 {
-                    g.FillRectangle(Brushes.White, valueX - 3, valueY - 2,
-                        valueSize.Width + 6, valueSize.Height + 4);
-                    g.DrawRectangle(new Pen(Color.FromArgb(230, 230, 230)),
-                        valueX - 3, valueY - 2, valueSize.Width + 6, valueSize.Height + 4);
-                    g.DrawString(valueText, valueFont, Brushes.DarkSlateGray, valueX, valueY);
+                    SizeF textSize = g.MeasureString(valueText, valueFont);
+                    float textX = x + (barWidth - textSize.Width) / 2;
+                    float textY = y - textSize.Height - 2;
+
+                    if (textY > chartY)
+                    {
+                        g.DrawString(valueText, valueFont, Brushes.Black, textX, textY);
+                    }
                 }
 
                 // Draw day label
                 string dayText = days[i];
-                Font dayFont = new Font("Segoe UI", 10F, FontStyle.Regular);
-                SizeF daySize = g.MeasureString(dayText, dayFont);
-                g.DrawString(dayText, dayFont, Brushes.DimGray,
-                    points[i].X - (daySize.Width / 2), chartY + chartHeight + 5);
+                using (Font dayFont = new Font("Segoe UI", 9, FontStyle.Regular))
+                {
+                    SizeF textSize = g.MeasureString(dayText, dayFont);
+                    float textX = x + (barWidth - textSize.Width) / 2;
+                    g.DrawString(dayText, dayFont, Brushes.DimGray, textX, chartY + chartHeight + 5);
+                }
             }
 
-            // Y-axis label
-            Font yAxisFont = new Font("Segoe UI", 10F, FontStyle.Bold);
-            StringFormat yAxisFormat = new StringFormat();
-            yAxisFormat.Alignment = StringAlignment.Center;
-            yAxisFormat.LineAlignment = StringAlignment.Center;
-
-            RectangleF yAxisRect = new RectangleF(5, chartY, 30, chartHeight);
-            g.DrawString("($)", yAxisFont, Brushes.DimGray, yAxisRect, yAxisFormat);
+            // Draw Y-axis label
+            using (Font axisFont = new Font("Segoe UI", 8, FontStyle.Bold))
+            {
+                g.DrawString("Amount ($)", axisFont, Brushes.Gray, 5, chartY + 10);
+            }
         }
 
         private void HandleStatCardClick(string title)
